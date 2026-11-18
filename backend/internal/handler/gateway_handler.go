@@ -1160,10 +1160,10 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 	}
 
 	// Mailbox groups have no upstream accounts to derive a catalog
-	// from; they advertise exactly the one model the mailbox service
-	// is offered under.
+	// from; they advertise the configured mailbox model menu (the real
+	// free model list the answerer pool rotates through).
 	if platform == service.PlatformMailbox {
-		writeModelsList(c, platform, []string{MailboxModelID})
+		writeModelsList(c, platform, MailboxModelIDs)
 		return
 	}
 
@@ -1273,7 +1273,7 @@ func (h *GatewayHandler) codexModelIDsForGroup(ctx context.Context, group *servi
 		platform = group.Platform
 	}
 	if platform == service.PlatformMailbox {
-		return []string{MailboxModelID}
+		return MailboxModelIDs
 	}
 	if platform == service.PlatformComposite {
 		availableModels := h.compositeAvailableModels(ctx, groupID, service.CompositeRouteEndpointResponses, false)

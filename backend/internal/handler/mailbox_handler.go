@@ -55,12 +55,40 @@ import (
 
 const mailboxPlatform = service.PlatformMailbox
 
-// MailboxModelID is the single model a mailbox group advertises. The
-// answerer behind the spool is model-agnostic, but the service is
-// offered under exactly this name, so /v1/models for a mailbox group
-// returns just this one entry instead of falling back to a stock
-// catalog (see GatewayHandler.Models).
+// MailboxModelID is the legacy single model a mailbox group advertised.
+// Kept for backward compatibility; new /v1/models uses MailboxModelIDs below.
 const MailboxModelID = "meta/muse-spark-1.3-contributor"
+
+// MailboxModelIDs is the model menu advertised to mailbox-group clients via
+// /v1/models. It mirrors OpenCode's real free model list (the answerer pool).
+// Override at runtime with MAILBOX_MODEL_IDS (comma-separated).
+var MailboxModelIDs = []string{
+	"big-pickle",
+	"deepseek-v4.1-flash-free",
+	"hy4-flash-free",
+	"iceman-free",
+	"inkling-2-small-free",
+	"longcat-2.5-free",
+	"flint-40b-free",
+	"nemotron-3.5-super-vl-free",
+	"beam-free",
+	"mimo-v2.6-flash-free",
+	"nemotron-3.5-lightning-free",
+}
+
+func init() {
+	if raw := strings.TrimSpace(os.Getenv("MAILBOX_MODEL_IDS")); raw != "" {
+		var ids []string
+		for _, s := range strings.Split(raw, ",") {
+			if id := strings.TrimSpace(s); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) > 0 {
+			MailboxModelIDs = ids
+		}
+	}
+}
 
 // MailboxHandler serves /v1/responses and /v1/chat/completions for
 // mailbox-platform groups.
@@ -179,6 +207,7 @@ type mailboxToolIntent struct {
 type mailboxAnswer struct {
 	ID         string              `json:"id"` // == question id
 	Text       string              `json:"text"`
+	Reasoning  string              `json:"reasoning,omitempty"` // real model thinking (optional)
 	ToolCalls  []mailboxToolIntent `json:"tool_calls,omitempty"`
 	AnsweredBy string              `json:"answered_by,omitempty"`
 	AnsweredAt time.Time           `json:"answered_at"`
@@ -554,11 +583,23 @@ func (t mailboxDeclaredTool) hasProp(p string) bool {
 
 func (t mailboxDeclaredTool) isActionTool() bool { return t.hasProp("action") }
 
+// shellProp returns the declared property name that carries a shell
+// command string. Clients differ: Codex-style tools use "cmd", OpenAI
+// style uses "command". Return "" when the tool is not shell-shaped.
+func (t mailboxDeclaredTool) shellProp() string {
+	for _, key := range []string{"command", "cmd"} {
+		if t.hasProp(key) {
+			return key
+		}
+	}
+	return ""
+}
+
 // isShellTool reports whether the tool's only calling shape is a
-// command string/array. Action tools also carrying a "command"
-// property are excluded: they are driven through their action form.
+// command string/array. Action tools also carrying a command property
+// are excluded: they are driven through their action form.
 func (t mailboxDeclaredTool) isShellTool() bool {
-	return t.hasProp("command") && !t.isActionTool()
+	return t.shellProp() != "" && !t.isActionTool()
 }
 
 func (t mailboxDeclaredTool) mentions(s string) bool {
@@ -616,11 +657,15 @@ func shellQuote(s string) string {
 // array, else as a plain string; cwd lands in cwd/workdir if declared.
 func shellShaped(tool mailboxDeclaredTool, cmdline string, args gjson.Result) (map[string]json.RawMessage, string) {
 	picked := map[string]json.RawMessage{}
-	if tool.props["command"].Get("type").String() == "array" {
+	shellKey := tool.shellProp()
+	if shellKey == "" {
+		shellKey = "command"
+	}
+	if tool.props[shellKey].Get("type").String() == "array" {
 		b, _ := json.Marshal([]string{"bash", "-lc", cmdline})
-		picked["command"] = b
+		picked[shellKey] = b
 	} else {
-		picked["command"] = rawString(cmdline)
+		picked[shellKey] = rawString(cmdline)
 	}
 	if cwd := args.Get("cwd"); cwd.Exists() {
 		for _, k := range []string{"cwd", "workdir", "working_dir"} {
@@ -878,7 +923,7 @@ func mapIntent(tools []mailboxDeclaredTool, intent string, args gjson.Result) (m
 			}
 			return t, shaped, ""
 		}
-		if t, ok := pickNamedTool(tools, "shell", "exec", "run_command", "bash", "terminal", "execute_command"); ok && t.hasProp("command") {
+		if t, ok := pickNamedTool(tools, "shell", "exec", "run_command", "bash", "terminal", "execute_command", "exec_command"); ok && t.shellProp() != "" {
 			shaped, why := shellShaped(t, command, args)
 			if why != "" {
 				return mapFail(why)
@@ -950,9 +995,10 @@ type mailboxMappedCall struct {
 // the client will see (rejected intents appended in plain sight) and
 // the mapped calls it will receive.
 type mailboxResolved struct {
-	Text     string
-	Calls    []mailboxMappedCall
-	Rejected []mailboxRejectedCall
+	Text      string
+	Reasoning string
+	Calls     []mailboxMappedCall
+	Rejected  []mailboxRejectedCall
 }
 
 func truncateStr(s string, n int) string {
@@ -968,7 +1014,7 @@ func truncateStr(s string, n int) string {
 // intents are appended to the visible text and recorded for the
 // session record; they are never silently dropped (PLAN §9).
 func resolveAnswer(session *mailboxSession, q *mailboxQuestion, ans *mailboxAnswer) *mailboxResolved {
-	res := &mailboxResolved{Text: ans.Text}
+	res := &mailboxResolved{Text: ans.Text, Reasoning: ans.Reasoning}
 	if len(ans.ToolCalls) == 0 {
 		return res
 	}
@@ -1292,6 +1338,14 @@ func (h *MailboxHandler) responsesObject(session *mailboxSession, status string,
 	}
 	if status == "completed" && res != nil {
 		var items []any
+		if res.Reasoning != "" {
+			items = append(items, map[string]any{
+				"id":      "rs_" + session.LastQuestionID,
+				"type":    "reasoning",
+				"status":  "completed",
+				"summary": []any{map[string]any{"type": "summary_text", "text": res.Reasoning}},
+			})
+		}
 		if res.Text != "" {
 			items = append(items, map[string]any{
 				"id":      "msg_" + session.LastQuestionID,
@@ -1398,7 +1452,13 @@ func (h *MailboxHandler) Responses(c *gin.Context) {
 	// transport-level keepalive underneath.
 	rsID := "rs_" + q.ID
 	rsTicks := 0
-	rsSummary := func() string { return strings.Repeat("…", rsTicks) }
+	reasoningText := "" // filled with the real model reasoning once the answer lands
+	rsSummary := func() string {
+		if reasoningText != "" {
+			return reasoningText
+		}
+		return strings.Repeat("…", rsTicks)
+	}
 	rsItem := func(status string) map[string]any {
 		return map[string]any{
 			"id": rsID, "type": "reasoning", "status": status,
@@ -1421,6 +1481,19 @@ func (h *MailboxHandler) Responses(c *gin.Context) {
 	}
 	rsBeat() // first beat at t=0, not after the first keepalive interval
 	ans, outcome := h.pollAnswer(c, q.ID, func() { writeSSEComment(c, "ping"); rsBeat() })
+	var res *mailboxResolved
+	if outcome == mailboxAnswered {
+		res = resolveAnswer(session, q, ans)
+		if res.Reasoning != "" {
+			reasoningText = res.Reasoning
+			// Stream the real model reasoning into the reasoning item. The
+			// "…" heartbeats above were pure wait filler; now that the answer
+			// has landed, replace the visible summary with actual thinking.
+			emit("response.reasoning_summary_text.delta", map[string]any{
+				"item_id": rsID, "output_index": 0, "summary_index": 0, "delta": reasoningText,
+			})
+		}
+	}
 	if outcome != mailboxClientGone {
 		emit("response.reasoning_summary_text.done", map[string]any{
 			"item_id": rsID, "output_index": 0, "summary_index": 0, "text": rsSummary(),
@@ -1432,10 +1505,6 @@ func (h *MailboxHandler) Responses(c *gin.Context) {
 		emit("response.output_item.done", map[string]any{
 			"output_index": 0, "item": rsItem("completed"),
 		})
-	}
-	var res *mailboxResolved
-	if outcome == mailboxAnswered {
-		res = resolveAnswer(session, q, ans)
 	}
 	h.settle(session, q, ans, res, outcome, started)
 	switch outcome {
@@ -1507,12 +1576,16 @@ func (h *MailboxHandler) Responses(c *gin.Context) {
 		outIdx++
 	}
 	completedObj := h.responsesObject(session, "completed", res, started)
-	// Keep the completed object's output aligned with the streamed
-	// indices: the wait-heartbeat reasoning item is output 0.
-	if items, _ := completedObj["output"].([]any); items != nil {
-		completedObj["output"] = append([]any{rsItem("completed")}, items...)
-	} else {
-		completedObj["output"] = []any{rsItem("completed")}
+	// Keep the completed object's output aligned with the streamed indices.
+	// When real reasoning exists, responsesObject already emitted the
+	// reasoning item at output 0 (same id as rsID), so don't prepend a
+	// duplicate. Otherwise the wait-heartbeat reasoning item is output 0.
+	if res == nil || res.Reasoning == "" {
+		if items, _ := completedObj["output"].([]any); items != nil {
+			completedObj["output"] = append([]any{rsItem("completed")}, items...)
+		} else {
+			completedObj["output"] = []any{rsItem("completed")}
+		}
 	}
 	emit("response.completed", map[string]any{"response": completedObj})
 }
@@ -1557,6 +1630,9 @@ func (h *MailboxHandler) ChatCompletions(c *gin.Context) {
 		switch outcome {
 		case mailboxAnswered:
 			msg := map[string]any{"role": "assistant", "content": res.Text}
+			if res.Reasoning != "" {
+				msg["reasoning_content"] = res.Reasoning
+			}
 			finishReason := "stop"
 			if len(res.Calls) > 0 {
 				var tcs []any
@@ -1617,6 +1693,12 @@ func (h *MailboxHandler) ChatCompletions(c *gin.Context) {
 	var res *mailboxResolved
 	if outcome == mailboxAnswered {
 		res = resolveAnswer(session, q, ans)
+		if res.Reasoning != "" {
+			// Replace the "…" wait filler with the real model reasoning.
+			for _, piece := range chunkText(res.Reasoning, 120) {
+				chunk(map[string]any{"reasoning_content": piece}, nil)
+			}
+		}
 	}
 	h.settle(session, q, ans, res, outcome, started)
 	switch outcome {
